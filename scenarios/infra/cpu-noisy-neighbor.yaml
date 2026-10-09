@@ -1,0 +1,38 @@
+# A CPU-hungry batch job ("video-transcoder") is scheduled onto the nodes
+# running order-service (via pod affinity) and burns all their cores.
+# order-service — an innocent tenant sharing those nodes — is starved of CPU:
+# its usage collapses well below what it wants, even though nothing is wrong
+# with order-service or its dependencies. Tests whether an RCA tool reasons
+# about node-level CPU contention and locality rather than blaming the victim.
+apiVersion: maintenance.platform.dev/v1alpha1
+kind: MaintenanceJob
+metadata:
+  name: sc-12
+  namespace: default
+spec:
+  displayName: CPU noisy neighbor starving order-service
+  description: >-
+    A batch "video-transcoder" workload lands on the nodes running
+    order-service and consumes all spare CPU. order-service is Burstable (it
+    normally bursts above its request), so under node saturation it loses the
+    CPU it relies on — its usage collapses toward its request share. The
+    culprit is a co-located noisy neighbor, not order-service or its database;
+    latency for its (I/O-bound) endpoints stays low, so the tell is the CPU
+    starvation, not the latency.
+  category: infra
+  icon: cpu
+  duration: 10m
+  expectedSymptoms:
+    - node CPU saturates (~100%) on the nodes running order-service
+    - order-service CPU usage is forced far below its normal level (starved)
+    - the culprit is a separate "video-transcoder" workload co-located on those nodes
+    - order-service's dependencies (MySQL, Kafka) stay healthy; the cause is node-local CPU
+  actions:
+    - name: a1
+      type: Workload
+      workload:
+        name: sc-12-w1
+        image: busybox:1.36
+        cpuBurn: 16
+        concurrency: 2
+        colocateWithApp: order-service

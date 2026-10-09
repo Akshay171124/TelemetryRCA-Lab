@@ -1,0 +1,71 @@
+# Least-privilege RBAC for the maintenance controller: everything it touches lives
+# in the default namespace. Deliberately NO access to Secrets — workload Jobs
+# reference them via secretKeyRef, resolved by the kubelet, not the operator.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maintenance-controller
+  namespace: default
+  labels:
+    app: maintenance-controller
+    app.kubernetes.io/part-of: platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maintenance-controller
+  namespace: default
+  labels:
+    app: maintenance-controller
+    app.kubernetes.io/part-of: platform
+rules:
+  - apiGroups: ["maintenance.platform.dev"]
+    resources:
+      - maintenancejobs
+      - maintenancejobs/status
+      - maintenancejobs/finalizers
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["batch"]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: ["apps"]
+    resources: [deployments]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: ["apps"]
+    resources: [deployments/scale]
+    verbs: [get, patch, update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  # maintenance-controller-state (force-release token dump)
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+  # leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Chaos Mesh fault objects (ChaosMesh action)
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["networkchaos","stresschaos","iochaos","podchaos","timechaos","httpchaos","dnschaos"]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maintenance-controller
+  namespace: default
+  labels:
+    app: maintenance-controller
+    app.kubernetes.io/part-of: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maintenance-controller
+subjects:
+  - kind: ServiceAccount
+    name: maintenance-controller
+    namespace: default

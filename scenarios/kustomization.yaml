@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+  - database/pg-analytics-queries.yaml
+  - database/pg-exclusive-lock.yaml
+  - database/mysql-analytics-queries.yaml
+  - database/mysql-lock-contention.yaml
+  - database/mysql-missing-index.yaml
+  - database/mongo-primary-failover.yaml
+  - deploy/order-service-gc-regression.yaml
+  - deploy/order-service-memory-leak.yaml
+  - deploy/product-catalog-gc-pressure.yaml
+  - deploy/recommendation-memory-leak.yaml
+  - deploy/review-service-event-loop.yaml
+  - infra/traffic-spike.yaml
+  - infra/cpu-noisy-neighbor.yaml
+  - network/dns-slow-resolution.yaml
+  - network/network-delay-product-catalog.yaml
+  - reliability/pg-table-bloat.yaml
+  - reliability/pg-stale-statistics.yaml
+  - reliability/pg-vacuum-blocked.yaml
+  - reliability/pg-replication-lag.yaml
+  - database/mongo-inefficient-query.yaml
+  - reliability/pg-checkpointer.yaml
+  - reliability/mysql-galera-quorum-loss.yaml
+  - reliability/mysql-galera-cert-conflicts.yaml
+  - reliability/pg-xid-wraparound.yaml
+  - reliability/pg-checkpoints-stalled.yaml
+  - reliability/mongo-replica-network-fencing.yaml
+  - reliability/mongo-replication-lag.yaml

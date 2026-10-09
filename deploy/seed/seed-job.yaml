@@ -1,0 +1,80 @@
+# Data seeder: fills all databases up to TARGET_SIZE_GB total. Idempotent.
+# Applied by scripts/deploy.sh, which deletes any previous Job and substitutes
+# __SEED_SIZE_GB__ via sed before kubectl apply. Not part of a kustomization.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-seeder
+  namespace: default
+  labels:
+    app: data-seeder
+    part-of: telemetryrca-lab
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: data-seeder
+        part-of: telemetryrca-lab
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: data-seeder
+          image: ghcr.io/akshay171124/telemetryrca-lab/data-seeder:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            # PostgreSQL (Percona PG operator secrets; via pgBouncer)
+            - name: PG_PRODUCTS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: pg-pguser-products
+                  key: pgbouncer-uri
+            - name: PG_INVENTORY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: pg-pguser-inventory
+                  key: pgbouncer-uri
+            # MySQL (PXC via haproxy; per-user passwords in
+            # mysql-custom-user-secret, key = username)
+            - name: MYSQL_HOST
+              value: "mysql-haproxy"
+            - name: MYSQL_ORDERS_USER
+              value: orders
+            - name: MYSQL_ORDERS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-custom-user-secret
+                  key: orders
+            - name: MYSQL_PAYMENTS_USER
+              value: payments
+            - name: MYSQL_PAYMENTS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-custom-user-secret
+                  key: payments
+            # MongoDB: credentials as kwargs (see seed.py); URI has no password.
+            # Writes go to the primary.
+            - name: MONGO_URI
+              value: "mongodb://mongodb-rs0:27017/reviews?replicaSet=rs0&authSource=reviews&readPreference=primary"
+            - name: MONGO_USER
+              value: reviews
+            - name: MONGO_AUTH_SOURCE
+              value: reviews
+            - name: MONGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-custom-user-secret
+                  key: reviews
+            # Valkey
+            - name: VALKEY_URL
+              value: "redis://valkey-valkey:6379"
+            # Substituted by scripts/deploy.sh (sed) before apply.
+            - name: TARGET_SIZE_GB
+              value: "__SEED_SIZE_GB__"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

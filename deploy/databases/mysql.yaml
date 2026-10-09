@@ -1,0 +1,105 @@
+# MySQL (Percona XtraDB Cluster): one cluster, two databases (orders,
+# payments). Databases are created by the mysql-init Job
+# (deploy/databases/jobs/mysql-init.yaml, applied by scripts/deploy.sh after
+# the cluster is ready); users are declarative below. The operator generates
+# passwords for them in the Secret mysql-custom-user-secret (key = username);
+# system/root credentials live in the Secret mysql-secrets. Those Service and
+# Secret names are the whole contract the rest of the lab has with MySQL: with
+# `make deploy EXTERNAL_DBS=mysql` this CR (and the operator) are not
+# installed and an external MySQL provides them (docs/external-databases.md).
+apiVersion: pxc.percona.com/v1
+kind: PerconaXtraDBCluster
+metadata:
+  name: mysql
+  namespace: default
+spec:
+  crVersion: "1.20.0"
+  enableVolumeExpansion: true
+  pxc:
+    size: 3
+    image: docker.io/percona/percona-xtradb-cluster:8.4.8-8.1
+    configuration: |
+      [mysqld]
+      # Pin the buffer pool instead of letting the operator autotune it to 50%
+      # of the memory limit. InnoDB's non-buffer-pool memory (ancillary
+      # structures, per-connection buffers with max_connections=170, Galera)
+      # runs roughly as large as the buffer pool itself, so a 50%-of-limit pool
+      # leaves too little headroom and the container OOM-kills as the pool warms.
+      # 1Gi pool under a 3Gi limit leaves ~2Gi for everything else.
+      innodb_buffer_pool_size = 1G
+      # Keep binary logs bounded. The lab has no external async replicas, and PXC
+      # uses its gcache (not binlogs) for node recovery, so a short retention is
+      # safe. The 30-day default (binlog_expire_logs_seconds=2592000) fills the
+      # 8Gi volume in ~2 days at the lab's write rate. Smaller max_binlog_size
+      # makes files rotate (and become eligible for expiry) promptly.
+      binlog_expire_logs_seconds = 3600
+      max_binlog_size = 268435456
+    # Coroot database monitoring: scrape each PXC node as the operator's
+    # built-in 'monitor' user (created for remote monitoring; password in the
+    # Secret mysql-secrets, key 'monitor'). PXC serves TLS with an operator-
+    # generated cert that has no IP SANs, and Coroot connects by pod IP, so use
+    # 'skip-verify' (encrypt without validating the cert) rather than 'true'
+    # (which would fail cert verification).
+    annotations:
+      coroot.com/mysql-scrape: "true"
+      coroot.com/mysql-scrape-port: "3306"
+      coroot.com/mysql-scrape-param-tls: "skip-verify"
+      coroot.com/mysql-scrape-credentials-username: "monitor"
+      coroot.com/mysql-scrape-credentials-secret-name: "mysql-secrets"
+      coroot.com/mysql-scrape-credentials-secret-password-key: "monitor"
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1536Mi
+      limits:
+        cpu: "2"
+        # 3Gi (was 2Gi): a 1Gi buffer pool + InnoDB overhead + connections needs
+        # ~2.5Gi RSS under load; 2Gi OOM-killed the pods repeatedly.
+        memory: 3Gi
+    volumeSpec:
+      persistentVolumeClaim:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # Continuous load grows orders/payments; the mysql-retention CronJob
+            # bounds row growth, and this gives comfortable headroom.
+            storage: 20Gi
+  haproxy:
+    enabled: true
+    size: 2
+    image: docker.io/percona/haproxy:2.8.18-1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  users:
+    - name: orders
+      dbs:
+        - orders
+      hosts:
+        - "%"
+      grants:
+        - SELECT
+        - INSERT
+        - UPDATE
+        - DELETE
+        - CREATE
+        - ALTER
+        - INDEX
+        - DROP
+        - REFERENCES
+    - name: payments
+      dbs:
+        - payments
+      hosts:
+        - "%"
+      grants:
+        - SELECT
+        - INSERT
+        - UPDATE
+        - DELETE
+        - CREATE
+        - ALTER
+        - INDEX
+        - DROP
+        - REFERENCES

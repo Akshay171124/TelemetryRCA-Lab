@@ -1,0 +1,94 @@
+# Forces the MongoDB replica set to fail over by stepping down the current
+# primary (replSetStepDown, force). This is a real election, not a simulated
+# one: the acting primary relinquishes, the remaining members hold an election,
+# one is promoted, and the stepped-down member rejoins as a secondary. For a
+# short window during the election there is no primary, so writes (and the
+# review-service's create-review calls) fail or block until a new primary is
+# available; reads with readPreference secondaryPreferred keep working. Doing it
+# by step-down rather than by killing a fixed pod is deliberate: PSMDB assigns
+# the primary dynamically and exposes no role label, so a pod-kill by name lands
+# on a secondary (and does nothing) whenever a prior failover has moved the
+# primary. Step-down always targets whoever is primary right now, and looping it
+# produces repeated elections - the flapping-primary reliability problem a good
+# tool should surface (primary changes, brief no-primary gaps). Reverting deletes
+# the job; the last-elected primary simply stays.
+apiVersion: maintenance.platform.dev/v1alpha1
+kind: MaintenanceJob
+metadata:
+  name: sc-02
+  namespace: default
+spec:
+  displayName: MongoDB primary step-down (replica-set failover)
+  description: >-
+    Repeatedly steps down the current MongoDB primary (replSetStepDown, force),
+    forcing the replica set to elect a new one each time. Each step-down is a real
+    election: the acting primary relinquishes, a secondary is promoted, and the
+    former primary rejoins and replays the oplog to catch up. During each election
+    there is a brief window with no primary, so writes - including the
+    review-service's create-review requests - fail or block until the new primary
+    is available, while secondaryPreferred reads continue. Unlike killing a fixed
+    pod by name (which lands on a secondary once the dynamic primary has moved, and
+    then does nothing), stepping down always targets whoever is primary now, and
+    looping it surfaces the flapping-primary reliability problem: primary changes
+    and repeated no-primary gaps. Reverting stops the workload; the current primary
+    stays put.
+  category: database
+  icon: mongodb
+  duration: 5m
+  expectedSymptoms:
+    - MongoDB primary elections occur repeatedly - the primary changes and there is a brief window with no primary in the replica set each time
+    - writes and the review-service's create-review requests fail or spike in latency during each no-primary window, then recover once a new primary is elected
+    - secondaryPreferred reads keep working through the failovers; the impact is on writes and on anything needing the primary
+    - the stepped-down member briefly leaves the PRIMARY state, then rejoins as a secondary and its replication lag returns to ~0
+    - the tell is a genuine election (a primary change), not a fabricated state; repeated elections are a flapping-primary reliability problem
+  actions:
+    # Loop replSetStepDown against the replica set. The driver routes the admin
+    # command to whoever is primary now, so this always hits the real primary
+    # regardless of which pod it landed on. Credentials (the operator's built-in
+    # clusterAdmin user, which holds replSetStepDown) are read from process.env
+    # inside the script and never appear on the command line or in the logs.
+    # Deleting the Job on revert stops the step-downs.
+    - name: a1
+      type: Workload
+      workload:
+        name: sc-02-w1
+        image: percona/percona-server-mongodb:7.0.39
+        concurrency: 1
+        env:
+          - name: MONGO_USER
+            valueFrom:
+              secretKeyRef:
+                name: internal-mongodb-users
+                key: MONGODB_CLUSTER_ADMIN_USER
+          - name: MONGO_PW
+            valueFrom:
+              secretKeyRef:
+                name: internal-mongodb-users
+                key: MONGODB_CLUSTER_ADMIN_PASSWORD
+        command:
+          - mongosh
+          - --nodb
+          - --quiet
+          - --eval
+          - |
+            const u = encodeURIComponent(process.env.MONGO_USER);
+            const p = encodeURIComponent(process.env.MONGO_PW);
+            const uri = `mongodb://${u}:${p}@mongodb-rs0:27017/admin?replicaSet=rs0&authSource=admin`;
+            while (true) {
+              try {
+                // step the current primary down for 30s (it can't re-win during that
+                // window) and don't wait more than 5s for a secondary to catch up, so
+                // an election happens promptly. force:true so it steps down even if no
+                // secondary is fully caught up.
+                Mongo(uri).getDB('admin').adminCommand({
+                  replSetStepDown: 30,
+                  secondaryCatchUpPeriodSecs: 5,
+                  force: true,
+                });
+              } catch (e) {
+                // stepDown closes the connection on success - expected
+              }
+              // pace the failovers: one election roughly every 45s so the replica set
+              // fully recovers between them (elections are visible but not a permanent outage)
+              sleep(45000);
+            }

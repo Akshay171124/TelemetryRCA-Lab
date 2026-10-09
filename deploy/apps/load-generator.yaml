@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: default
+  labels:
+    app: load-generator
+    part-of: telemetryrca-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+        part-of: telemetryrca-lab
+    spec:
+      containers:
+        - name: load-generator
+          image: ghcr.io/akshay171124/telemetryrca-lab/load-generator:1.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: otel-env
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: load-generator
+            - name: GATEWAY_URL
+              value: "http://api-gateway:8080"
+            - name: RPS_PER_SERVICE
+              value: "20"
+            # Drive review-service harder than the other services so it is a
+            # larger share (~40%) of the api-gateway's traffic. That way a problem
+            # in its MongoDB dependency (e.g. the mongo-inefficient-query scenario)
+            # moves the api-gateway's own latency enough to be visible upstream,
+            # not just at the review-service tier.
+            - name: RPS_OVERRIDES
+              value: "review-service:80"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

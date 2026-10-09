@@ -1,0 +1,36 @@
+# Single source of truth for image versions.
+# CI tags service images with these versions; deploy manifests pin them.
+# Bad-deploy variants publish their own (higher) tags declared in
+# services/<svc>/variants/<name>/variant.yaml.
+
+services:
+  api-gateway: 1.1.0            # propagate trace context on the grpc.aio recommendation call
+  product-catalog: 1.0.0
+  cart-service: 1.0.1          # cluster-aware Valkey client
+  order-service: 1.0.1          # glibc JRE base (snappy-java native lib needs glibc)
+  review-service: 1.0.1        # Mongo credentials as driver options
+  payment-service: 1.0.1       # MySQL credentials as discrete parts
+  inventory-service: 1.0.3     # perf: persistent conns, opcache tuning, optimized autoloader
+  recommendation-service: 1.0.0
+  fulfillment-service: 1.0.3   # MySQL has no CREATE INDEX IF NOT EXISTS (crashloop on 1.0.2)
+  load-generator: 1.4.0         # use real order ids; carts checked out before the cap
+  data-seeder: 1.0.7          # seed products before inventory; fail loudly; reserve order-id range
+  operator: 1.7.0             # DBExec job names scoped to the run (stale-job adoption bug)
+
+# Third-party pins (operators installed by scripts/deploy.sh via helm).
+charts:
+  pg-operator: 3.0.0        # Percona Operator for PostgreSQL
+  pxc-operator: 1.20.0      # Percona Operator for MySQL (PXC)
+  psmdb-operator: 1.23.0    # Percona Operator for MongoDB
+  strimzi-kafka-operator: 1.1.0
+  valkey-operator: 0.4.1    # valkey-io/valkey-operator (Valkey Cluster)
+  chaos-mesh: 2.7.2         # chaos-mesh (NetworkChaos etc. for fault scenarios)
+
+images:
+  postgres: docker.io/percona/percona-distribution-postgresql:18.3-2
+  pgbouncer: docker.io/percona/percona-pgbouncer:1.25.1-1
+  pxc: docker.io/percona/percona-xtradb-cluster:8.4.8-8.1
+  haproxy: docker.io/percona/haproxy:2.8.18-1
+  psmdb: docker.io/percona/percona-server-mongodb:7.0.39  # 8.x refuses kernel 6.19+ (SERVER-121912)
+  # valkey server image is managed by the valkey-operator (ValkeyCluster).
+  otel-collector: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.158.0

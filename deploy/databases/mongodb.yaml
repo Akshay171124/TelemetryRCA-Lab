@@ -1,0 +1,89 @@
+# MongoDB (Percona Server for MongoDB): 3-member replica set, database
+# "reviews". The declarative user below gets a generated password in the
+# Secret mongodb-custom-user-secret (key = username). The reviews database
+# itself is created implicitly on first write.
+apiVersion: psmdb.percona.com/v1
+kind: PerconaServerMongoDB
+metadata:
+  name: mongodb
+  namespace: default
+spec:
+  crVersion: "1.23.0"
+  # MongoDB 7.0, not 8.x: the 8.x line refuses to start on Linux kernel
+  # 6.19+ (MongoDB SERVER-121912), which breaks on modern host kernels
+  # such as Ubuntu 26.04's 7.0. 7.0 is a supported LTS and has no such
+  # check, so it runs on both old and new kernels.
+  image: docker.io/percona/percona-server-mongodb:7.0.39
+  replsets:
+    - name: rs0
+      size: 3
+      # Coroot database monitoring: scrape each replica-set member as the
+      # operator's built-in clusterMonitor user (credentials in the Secret
+      # internal-mongodb-users).
+      annotations:
+        coroot.com/mongodb-scrape: "true"
+        coroot.com/mongodb-scrape-port: "27017"
+        coroot.com/mongodb-scrape-credentials-secret-name: "internal-mongodb-users"
+        coroot.com/mongodb-scrape-credentials-secret-username-key: "MONGODB_CLUSTER_MONITOR_USER"
+        coroot.com/mongodb-scrape-credentials-secret-password-key: "MONGODB_CLUSTER_MONITOR_PASSWORD"
+      configuration: |
+        storage:
+          wiredTiger:
+            engineConfig:
+              cacheSizeGB: 0.5
+        net:
+          maxIncomingConnections: 500
+        # Enable the database profiler persistently so Coroot can collect
+        # per-query statistics (the top-queries view / bad-query inspection).
+        # Setting it at runtime (db.setProfilingLevel) does NOT survive a mongod
+        # restart, so it belongs in the CR config. Percona Server for MongoDB can
+        # sample: mode "all" profiles every operation but rateLimit 100 records
+        # only 1 in 100, keeping the overhead bounded while still giving a
+        # representative sample of the normal (fast, indexed) query shapes - not
+        # just the slow ones a plain slowOp threshold would catch.
+        operationProfiling:
+          mode: all
+          slowOpThresholdMs: 200
+          rateLimit: 100
+      resources:
+        requests:
+          # Guarantee a full core so the health-check's authentication and the
+          # replication heartbeats still get CPU while mongod is busy serving a
+          # heavy query (e.g. the inefficient-query scenario's collection scans).
+          cpu: "1"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+      # A member that is busy serving a slow query is still alive. The default
+      # probes are tight enough that a sustained collection scan times out the
+      # health check, the member is marked not-ready and drops out of the
+      # headless service, and clients see connection/DNS failures - so a
+      # missing-index *latency* problem masquerades as replica-set instability
+      # and the RCA blames the instability instead of the query. These tolerant
+      # probes keep a busy-but-alive member in the set. Failover detection is
+      # unaffected: a pod-kill deletes the pod, so its DNS record is removed
+      # regardless of the failure threshold.
+      livenessProbe:
+        timeoutSeconds: 15
+        periodSeconds: 30
+        failureThreshold: 6
+      readinessProbe:
+        timeoutSeconds: 10
+        periodSeconds: 10
+        failureThreshold: 6
+      volumeSpec:
+        persistentVolumeClaim:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              # Continuous review traffic grows the reviews collection; the
+              # mongo-retention CronJob bounds it to ~7 days (~2 GB of files),
+              # which leaves room for the ~1 GB oplog and diagnostic data.
+              storage: 5Gi
+  users:
+    - name: reviews
+      db: reviews
+      roles:
+        - name: readWrite
+          db: reviews

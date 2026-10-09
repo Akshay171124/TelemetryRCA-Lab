@@ -1,0 +1,29 @@
+# Valkey in Cluster mode, managed by the valkey-io/valkey-operator.
+# 3 shards x 1 replica (6 nodes): a real sharded cluster with failover, which
+# is what the cart-service and seeder connect to as a cluster-aware client.
+# Clients reach it via the operator-created headless Service "valkey-valkey"
+# (pattern: valkey-<clusterName>) on port 6379. No auth (no users defined).
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: valkey
+  namespace: default
+spec:
+  shards: 3
+  replicas: 1
+  # Cart/cache workload: evict least-recently-used keys under memory pressure.
+  config:
+    maxmemory-policy: allkeys-lru
+  # Prometheus redis_exporter sidecar is not used here (telemetry is OTLP-based
+  # and Coroot reads Valkey directly); disable it to keep pods lean.
+  exporter:
+    enabled: false
+  persistence:
+    size: 2Gi
+    reclaimPolicy: Delete
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi

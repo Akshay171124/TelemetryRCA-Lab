@@ -1,0 +1,410 @@
+package actions
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/Akshay171124/TelemetryRCA-Lab/operator/api/v1alpha1"
+)
+
+func testScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func testRC() RunContext {
+	return RunContext{
+		ScenarioName:  "pg-analytics-queries",
+		ScenarioUID:   types.UID("uid-1"),
+		Namespace:     "default",
+		RunID:         "run-1",
+		OperatorImage: "ghcr.io/akshay171124/telemetryrca-lab/operator:1.0.0",
+	}
+}
+
+// TestWorkloadPlanTokenRoundTrip checks that the Workload Plan token is
+// self-contained and round-trips, and that a name conflict is rejected.
+func TestWorkloadPlanTokenRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	rc := testRC()
+	spec := &v1alpha1.Action{
+		Name: "analytics-reporting",
+		Type: v1alpha1.ActionTypeWorkload,
+		Workload: &v1alpha1.WorkloadAction{
+			Name:    "analytics-reporting",
+			Engine:  "postgres",
+			Queries: []string{"SELECT 1"},
+		},
+	}
+	w := &Workload{}
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	raw, err := w.Plan(ctx, c, rc, spec)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var tok WorkloadToken
+	if err := json.Unmarshal(raw, &tok); err != nil {
+		t.Fatalf("token does not round-trip: %v", err)
+	}
+	want := WorkloadToken{Kind: "Job", Namespace: "default", Name: "analytics-reporting"}
+	if tok != want {
+		t.Fatalf("token = %+v, want %+v", tok, want)
+	}
+
+	// A foreign Job with the same name must fail the plan.
+	foreign := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "analytics-reporting", Namespace: "default",
+		Labels: map[string]string{ScenarioLabel: "someone-else"},
+	}}
+	c = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(foreign).Build()
+	if _, err := w.Plan(ctx, c, rc, spec); err == nil {
+		t.Fatal("Plan should reject a name conflict with a foreign job")
+	}
+}
+
+// TestScaleTokenRoundTrip checks that Plan captures the live replica count in
+// a self-contained token and that Revert restores it from the token alone.
+func TestScaleTokenRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	rc := testRC()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "load-generator", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(2))},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(dep).Build()
+	spec := &v1alpha1.Action{
+		Name: "scale-up-load",
+		Type: v1alpha1.ActionTypeScale,
+		Scale: &v1alpha1.ScaleAction{
+			TargetRef: v1alpha1.ScaleTargetRef{Kind: "Deployment", Name: "load-generator"},
+			Replicas:  5,
+		},
+	}
+	s := &Scale{}
+
+	raw, err := s.Plan(ctx, c, rc, spec)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var tok ScaleToken
+	if err := json.Unmarshal(raw, &tok); err != nil {
+		t.Fatalf("token does not round-trip: %v", err)
+	}
+	want := ScaleToken{Kind: "Deployment", Namespace: "default", Name: "load-generator", PreviousReplicas: 2}
+	if tok != want {
+		t.Fatalf("token = %+v, want %+v", tok, want)
+	}
+
+	done, _, err := s.Ensure(ctx, c, rc, spec, raw)
+	if err != nil || !done {
+		t.Fatalf("Ensure: done=%v err=%v", done, err)
+	}
+	got := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "load-generator"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if *got.Spec.Replicas != 5 || got.Annotations[HeldByAnnotation] != "pg-analytics-queries/run-1" {
+		t.Fatalf("Ensure did not apply: replicas=%d annotations=%v", *got.Spec.Replicas, got.Annotations)
+	}
+
+	// Revert from the token alone (twice: must be idempotent).
+	for i := 0; i < 2; i++ {
+		done, _, err = s.Revert(ctx, c, rc, raw)
+		if err != nil || !done {
+			t.Fatalf("Revert #%d: done=%v err=%v", i+1, done, err)
+		}
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "load-generator"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if *got.Spec.Replicas != 2 {
+		t.Fatalf("Revert did not restore replicas: got %d, want 2", *got.Spec.Replicas)
+	}
+	if _, held := got.Annotations[HeldByAnnotation]; held {
+		t.Fatalf("Revert did not remove the held-by annotation: %v", got.Annotations)
+	}
+
+	// Revert with a vanished target is done, not an error.
+	empty := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	done, _, err = s.Revert(ctx, empty, rc, raw)
+	if err != nil || !done {
+		t.Fatalf("Revert on vanished target: done=%v err=%v", done, err)
+	}
+}
+
+// TestChaosMeshTokenAndBuild checks the ChaosMesh token round-trips and that
+// buildChaos wires the dead-man duration, owner ref, scenario label and
+// verbatim spec passthrough.
+func TestChaosMeshTokenAndBuild(t *testing.T) {
+	rc := testRC()
+	rc.RunDuration = 15 * time.Minute
+
+	ca := &v1alpha1.ChaosMeshAction{
+		Kind: "NetworkChaos",
+		Spec: apiextensionsv1.JSON{Raw: []byte(`{"action":"delay","mode":"all"}`)},
+	}
+	spec := &v1alpha1.Action{Name: "net-delay", Type: v1alpha1.ActionTypeChaosMesh, ChaosMesh: ca}
+	m := &ChaosMesh{}
+
+	name := chaosObjectName(ca, rc, spec.Name)
+	if name != "mj-pg-analytics-queries-net-delay" {
+		t.Fatalf("name = %q", name)
+	}
+
+	tok := ChaosMeshToken{APIVersion: chaosMeshAPIVersion, Kind: ca.Kind, Namespace: rc.Namespace, Name: name}
+	raw, err := json.Marshal(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ChaosMeshToken
+	if err := json.Unmarshal(raw, &back); err != nil || back != tok {
+		t.Fatalf("token round-trip: %+v err=%v", back, err)
+	}
+
+	obj, err := m.buildChaos(rc, ca, tok)
+	if err != nil {
+		t.Fatalf("buildChaos: %v", err)
+	}
+	if obj.GetAPIVersion() != chaosMeshAPIVersion || obj.GetKind() != "NetworkChaos" {
+		t.Fatalf("gvk = %s/%s", obj.GetAPIVersion(), obj.GetKind())
+	}
+	if obj.GetLabels()[ScenarioLabel] != rc.ScenarioName {
+		t.Fatalf("missing scenario label: %v", obj.GetLabels())
+	}
+	if refs := obj.GetOwnerReferences(); len(refs) != 1 || refs[0].Name != rc.ScenarioName || refs[0].UID != rc.ScenarioUID {
+		t.Fatalf("owner refs = %+v", refs)
+	}
+	cs, _ := obj.Object["spec"].(map[string]any)
+	if cs["action"] != "delay" || cs["mode"] != "all" {
+		t.Fatalf("spec not passed through: %v", cs)
+	}
+	// Dead-man switch: run duration + 5m margin.
+	if cs["duration"] != "20m0s" {
+		t.Fatalf("duration = %v, want 20m0s", cs["duration"])
+	}
+
+	// A caller-provided duration is left untouched; 0 run duration -> 24h.
+	ca2 := &v1alpha1.ChaosMeshAction{Kind: "StressChaos", Spec: apiextensionsv1.JSON{Raw: []byte(`{"duration":"3m"}`)}}
+	obj2, _ := m.buildChaos(rc, ca2, tok)
+	if obj2.Object["spec"].(map[string]any)["duration"] != "3m" {
+		t.Fatalf("caller duration overwritten")
+	}
+	rc.RunDuration = 0
+	obj3, _ := m.buildChaos(rc, ca, tok)
+	if obj3.Object["spec"].(map[string]any)["duration"] != "24h" {
+		t.Fatalf("unbounded duration = %v, want 24h", obj3.Object["spec"].(map[string]any)["duration"])
+	}
+}
+
+// markJobSucceeded flips a Job's status to Succeeded in the fake client so a
+// following Ensure/Revert pass observes completion.
+func markJobSucceeded(t *testing.T, ctx context.Context, c interface {
+	Get(context.Context, types.NamespacedName, client.Object, ...client.GetOption) error
+	Status() client.StatusWriter
+}, name string) {
+	t.Helper()
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: name}, job); err != nil {
+		t.Fatalf("get job %s: %v", name, err)
+	}
+	job.Status.Succeeded = 1
+	if err := c.Status().Update(ctx, job); err != nil {
+		t.Fatalf("mark %s succeeded: %v", name, err)
+	}
+}
+
+// TestDBExecEnsureRevert checks that DBExec creates a one-off Ensure Job with
+// --once args, reports done only once it succeeds, and that Revert runs the
+// revert statements from the token alone.
+func TestDBExecEnsureRevert(t *testing.T) {
+	ctx := context.Background()
+	rc := testRC()
+	spec := &v1alpha1.Action{
+		Name: "disable-autovacuum",
+		Type: v1alpha1.ActionTypeDBExec,
+		DBExec: &v1alpha1.DBExecAction{
+			Name:   "disable-autovacuum",
+			Engine: "postgres",
+			Ensure: []string{"ALTER TABLE products SET (autovacuum_enabled=false)"},
+			Revert: []string{"ALTER TABLE products SET (autovacuum_enabled=true)", "ANALYZE products"},
+		},
+	}
+	d := &DBExec{}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+
+	raw, err := d.Plan(ctx, c, rc, spec)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var tok DBExecToken
+	if err := json.Unmarshal(raw, &tok); err != nil {
+		t.Fatalf("token does not round-trip: %v", err)
+	}
+	wantEnsure, wantRevert := execJobNames("disable-autovacuum", rc.RunID)
+	if tok.EnsureName != wantEnsure || tok.RevertName != wantRevert || len(tok.Revert) != 2 {
+		t.Fatalf("token = %+v", tok)
+	}
+	if tok.EnsureName == "disable-autovacuum" {
+		t.Fatalf("job names must be scoped to the run, got %q", tok.EnsureName)
+	}
+
+	// First Ensure creates the Job and is not yet done.
+	done, ra, err := d.Ensure(ctx, c, rc, spec, raw)
+	if err != nil || done || ra <= 0 {
+		t.Fatalf("Ensure #1: done=%v ra=%v err=%v", done, ra, err)
+	}
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: tok.EnsureName}, job); err != nil {
+		t.Fatalf("ensure job not created: %v", err)
+	}
+	args := job.Spec.Template.Spec.Containers[0].Args
+	if len(args) < 4 || args[0] != "dbtool" || args[3] != "--once" {
+		t.Fatalf("unexpected ensure args: %v", args)
+	}
+
+	// Not done until the Job succeeds.
+	markJobSucceeded(t, ctx, c, tok.EnsureName)
+	done, _, err = d.Ensure(ctx, c, rc, spec, raw)
+	if err != nil || !done {
+		t.Fatalf("Ensure #2: done=%v err=%v", done, err)
+	}
+
+	// Revert creates the revert Job (from the token alone), done once it succeeds.
+	done, _, err = d.Revert(ctx, c, rc, raw)
+	if err != nil || done {
+		t.Fatalf("Revert #1: done=%v err=%v", done, err)
+	}
+	markJobSucceeded(t, ctx, c, tok.RevertName)
+	done, _, err = d.Revert(ctx, c, rc, raw)
+	if err != nil || !done {
+		t.Fatalf("Revert #2: done=%v err=%v", done, err)
+	}
+}
+
+// TestDBExecRerunIgnoresPreviousRunJobs is a regression test.
+//
+// Finished exec Jobs linger for TTLSecondsAfterFinished (600s), and runJob
+// reports done for any succeeded Job with the target name. When names were
+// fixed rather than run-scoped, a run started inside that window adopted the
+// previous run's Jobs and executed no SQL at all: an ensure that injected
+// nothing while reporting Active, or a revert that left the injected change in
+// place while reporting Completed.
+func TestDBExecRerunIgnoresPreviousRunJobs(t *testing.T) {
+	ctx := context.Background()
+	spec := &v1alpha1.Action{
+		Name: "drop-index",
+		Type: v1alpha1.ActionTypeDBExec,
+		DBExec: &v1alpha1.DBExecAction{
+			Name:   "drop-index",
+			Engine: "mysql",
+			Ensure: []string{"ALTER TABLE orders DROP KEY idx"},
+			Revert: []string{"ALTER TABLE orders ADD KEY idx (user_id)"},
+		},
+	}
+	d := &DBExec{}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+
+	// Run 1: drive ensure and revert both to completion. Their Jobs stay in
+	// the cluster afterwards, exactly as the TTL leaves them.
+	rc1 := testRC()
+	rc1.RunID = "run-1"
+	raw1, err := d.Plan(ctx, c, rc1, spec)
+	if err != nil {
+		t.Fatalf("Plan run 1: %v", err)
+	}
+	var tok1 DBExecToken
+	if err := json.Unmarshal(raw1, &tok1); err != nil {
+		t.Fatalf("token 1: %v", err)
+	}
+	if _, _, err := d.Ensure(ctx, c, rc1, spec, raw1); err != nil {
+		t.Fatalf("Ensure run 1: %v", err)
+	}
+	markJobSucceeded(t, ctx, c, tok1.EnsureName)
+	if _, _, err := d.Revert(ctx, c, rc1, raw1); err != nil {
+		t.Fatalf("Revert run 1: %v", err)
+	}
+	markJobSucceeded(t, ctx, c, tok1.RevertName)
+	if done, _, err := d.Revert(ctx, c, rc1, raw1); err != nil || !done {
+		t.Fatalf("Revert run 1 completion: done=%v err=%v", done, err)
+	}
+
+	// Run 2 starts while both of run 1's Jobs are still present.
+	rc2 := testRC()
+	rc2.RunID = "run-2"
+	raw2, err := d.Plan(ctx, c, rc2, spec)
+	if err != nil {
+		t.Fatalf("Plan run 2: %v", err)
+	}
+	var tok2 DBExecToken
+	if err := json.Unmarshal(raw2, &tok2); err != nil {
+		t.Fatalf("token 2: %v", err)
+	}
+	if tok2.EnsureName == tok1.EnsureName || tok2.RevertName == tok1.RevertName {
+		t.Fatalf("run 2 reuses run 1 job names: %q / %q", tok2.EnsureName, tok2.RevertName)
+	}
+
+	// Ensure must actually run: not done on the first pass, and a new Job.
+	done, _, err := d.Ensure(ctx, c, rc2, spec, raw2)
+	if err != nil {
+		t.Fatalf("Ensure run 2: %v", err)
+	}
+	if done {
+		t.Fatal("run 2 ensure adopted run 1's Job: the statements would never run")
+	}
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: tok2.EnsureName}, job); err != nil {
+		t.Fatalf("run 2 ensure job not created: %v", err)
+	}
+	markJobSucceeded(t, ctx, c, tok2.EnsureName)
+	if done, _, err = d.Ensure(ctx, c, rc2, spec, raw2); err != nil || !done {
+		t.Fatalf("Ensure run 2 completion: done=%v err=%v", done, err)
+	}
+
+	// Revert must actually run too. This is the damaging direction: adopting
+	// run 1's cleanup Job leaves the index dropped while reporting success.
+	done, _, err = d.Revert(ctx, c, rc2, raw2)
+	if err != nil {
+		t.Fatalf("Revert run 2: %v", err)
+	}
+	if done {
+		t.Fatal("run 2 revert adopted run 1's cleanup Job: the injected change would be left in place")
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: tok2.RevertName}, job); err != nil {
+		t.Fatalf("run 2 revert job not created: %v", err)
+	}
+}
+
+// TestDBExecRevertEmpty checks a DBExec with no revert statements reverts to
+// done immediately (nothing to undo).
+func TestDBExecRevertEmpty(t *testing.T) {
+	ctx := context.Background()
+	rc := testRC()
+	tok, _ := json.Marshal(DBExecToken{Namespace: "default", Engine: "postgres", EnsureName: "x", RevertName: "x-cleanup"})
+	d := &DBExec{}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	done, _, err := d.Revert(ctx, c, rc, tok)
+	if err != nil || !done {
+		t.Fatalf("Revert empty: done=%v err=%v", done, err)
+	}
+}

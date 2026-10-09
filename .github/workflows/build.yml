@@ -1,0 +1,168 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      all:
+        description: build all images regardless of changes
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changes.outputs.matrix }}
+      images: ${{ steps.changes.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changes
+        name: Compute changed image directories
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.all }}" = "true" ]; then
+            dirs=$(ls -d services/*/ operator/ | sed 's:/$::')
+          else
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              base="${{ github.event.pull_request.base.sha }}"
+            else
+              base="${{ github.event.before }}"
+              # first push / force push: build everything
+              if [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base" 2>/dev/null; then
+                base=""
+              fi
+            fi
+            if [ -z "$base" ]; then
+              dirs=$(ls -d services/*/ operator/ | sed 's:/$::')
+            else
+              dirs=$(git diff --name-only "$base" "${{ github.sha }}" \
+                | grep -E '^(services/[^/]+/|operator/)' \
+                | grep -v '/variants/' \
+                | sed -E 's:^(services/[^/]+|operator)/.*:\1:' | sort -u)
+            fi
+          fi
+          python3 - "$dirs" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os, sys, yaml
+          dirs = [d for d in sys.argv[1].split() if os.path.isfile(os.path.join(d, "Dockerfile"))]
+          versions = yaml.safe_load(open("versions.yaml"))["services"]
+          # One build job per image and architecture, each on a native runner
+          # (no QEMU); the merge job then stitches the per-arch digests into one
+          # multi-arch manifest per image.
+          runners = {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"}
+          builds, images = [], []
+          for d in dirs:
+              name = "operator" if d == "operator" else os.path.basename(d)
+              images.append({"name": name, "version": str(versions[name])})
+              for arch, runner in runners.items():
+                  builds.append({"name": name, "context": d, "arch": arch, "runner": runner})
+          print("matrix=" + json.dumps({"include": builds}))
+          print("images=" + json.dumps({"include": images}))
+          print("building:", [i["name"] for i in images], file=sys.stderr)
+          EOF
+
+  build:
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.matrix).include[0] }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/${{ matrix.arch }}
+          # Pushed by digest only (untagged); the merge job tags the manifest.
+          tags: ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }},mode=max
+      - name: Export digest
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          name: digest-${{ matrix.name }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combine the per-arch images into one multi-arch manifest per image and tag it.
+  merge:
+    needs: [detect, build]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.images) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-${{ matrix.name }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Immutable per-commit tag (what `make deploy` resolves to), plus the
+      # readable semver and a moving latest.
+      - name: Create and push the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          [ "$(ls | wc -l)" -eq 2 ] || { echo "expected one digest per arch, got: $(ls)"; exit 1; }
+          docker buildx imagetools create \
+            -t ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}:sha-${{ github.sha }} \
+            -t ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}:${{ matrix.version }} \
+            -t ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}:latest \
+            $(printf 'ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}@sha256:%s ' *)
+          docker buildx imagetools inspect ghcr.io/akshay171124/telemetryrca-lab/${{ matrix.name }}:${{ matrix.version }}
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The gitleaks GitHub Action requires a paid license for organizations;
+      # the CLI is free and license-free, so run it directly. Scan git history
+      # (tracked content only) so gitignored build artifacts are never flagged.
+      - name: Run gitleaks
+        run: |
+          version=8.28.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks git . --redact --no-banner --verbose
+
+  validate-scenarios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scenario image references
+        run: |
+          pip install --quiet pyyaml
+          python3 scripts/gen-variant-registry.py
+          python3 scripts/check-scenario-images.py

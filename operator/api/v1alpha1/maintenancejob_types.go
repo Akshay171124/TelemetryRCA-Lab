@@ -1,0 +1,350 @@
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Scenario phases.
+const (
+	PhaseIdle       = "Idle"
+	PhaseActivating = "Activating"
+	PhaseActive     = "Active"
+	PhaseReverting  = "Reverting"
+	PhaseDegraded   = "Degraded"
+)
+
+// Run triggers.
+const (
+	RunTriggerManual  = "Manual"
+	RunTriggerEnabled = "Enabled"
+)
+
+// Action phases (per active action).
+const (
+	ActionPhaseRecorded  = "Recorded"
+	ActionPhaseApplied   = "Applied"
+	ActionPhaseReverting = "Reverting"
+)
+
+// Run results (history).
+const (
+	RunResultCompleted = "Completed"
+	RunResultReverted  = "Reverted"
+	RunResultFailed    = "Failed"
+)
+
+// Condition types.
+const (
+	ConditionReady        = "Ready"
+	ConditionRevertFailed = "RevertFailed"
+)
+
+// Action types.
+const (
+	ActionTypeWorkload    = "Workload"
+	ActionTypeScale       = "Scale"
+	ActionTypeDeployImage = "DeployImage"
+	ActionTypeChaosMesh   = "ChaosMesh"
+	ActionTypeDBExec      = "DBExec"
+)
+
+// TriggerSpec requests a one-shot manual run: a runID different from
+// status.lastCompletedRunID starts a run of the given duration.
+type TriggerSpec struct {
+	// RunID identifies the requested run. A NEW value (different from
+	// status.lastCompletedRunID) starts a run.
+	RunID string `json:"runID"`
+	// Duration of the one-shot run. Falls back to spec.duration if empty.
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
+}
+
+// WorkloadAction runs a database-load Job that looks like a real workload.
+type WorkloadAction struct {
+	// Name is the workload identity (Job name, app label, container name),
+	// e.g. "analytics-reporting".
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+	// Image to run. Defaults to the operator's own image (env OPERATOR_IMAGE).
+	// +optional
+	Image string `json:"image,omitempty"`
+	// Command overrides the generated dbtool arguments.
+	// +optional
+	Command []string `json:"command,omitempty"`
+	// Engine selects the dbtool database driver.
+	// +kubebuilder:validation:Enum=postgres;mysql
+	// +optional
+	Engine string `json:"engine,omitempty"`
+	// Queries are SQL statements run in a loop by dbtool.
+	// +optional
+	Queries []string `json:"queries,omitempty"`
+	// Concurrency is the number of parallel workers (Job parallelism).
+	// +kubebuilder:default=2
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Concurrency int32 `json:"concurrency,omitempty"`
+	// Interval is the pause between query-loop iterations per worker.
+	// Defaults to 1s.
+	// +optional
+	Interval *metav1.Duration `json:"interval,omitempty"`
+	// Env is passed through to the workload container (DSN etc. via
+	// secretKeyRef).
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+	// DeadlineMargin is added to the run duration to compute the Job's
+	// activeDeadlineSeconds safety net. Defaults to 5m.
+	// +optional
+	DeadlineMargin *metav1.Duration `json:"deadlineMargin,omitempty"`
+	// ColocateWithApp schedules the workload onto nodes already running pods of
+	// this app (label app=<value> in the same namespace) via podAffinity — a
+	// realistic "noisy neighbor" that steals CPU from that app's node.
+	// +optional
+	ColocateWithApp string `json:"colocateWithApp,omitempty"`
+	// CPUBurn, when >0, runs this many busy-loop workers instead of dbtool (a
+	// CPU hog). Requires image (e.g. busybox) and command, or defaults to a
+	// shell busy-loop. Engine/Queries are ignored.
+	// +optional
+	CPUBurn int32 `json:"cpuBurn,omitempty"`
+}
+
+// ScaleTargetRef identifies the object a Scale action operates on.
+type ScaleTargetRef struct {
+	// +kubebuilder:validation:Enum=Deployment
+	// +kubebuilder:default=Deployment
+	Kind string `json:"kind"`
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// ScaleAction scales a Deployment to a given replica count for the duration
+// of the run.
+type ScaleAction struct {
+	TargetRef ScaleTargetRef `json:"targetRef"`
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas"`
+}
+
+// DeployImageAction rolls out a different image for one container of a
+// Deployment — a genuine version bump — and rolls it back on revert. The
+// known-good image is recorded in three places so the rollback is always
+// possible: the revert token in status, an annotation on the Deployment
+// itself, and (declaratively) this spec.
+type DeployImageAction struct {
+	TargetRef ScaleTargetRef `json:"targetRef"`
+	// Container is the container name within the Deployment's pod template.
+	// +kubebuilder:validation:MinLength=1
+	Container string `json:"container"`
+	// Image to deploy (the regression variant, plausibly tagged).
+	// +kubebuilder:validation:MinLength=1
+	Image string `json:"image"`
+	// KnownGoodImage is the declarative rollback target. If empty, the image
+	// observed at activation time is used.
+	// +optional
+	KnownGoodImage string `json:"knownGoodImage,omitempty"`
+	// RolloutTimeout bounds how long Ensure reports "progressing" before the
+	// action counts as applied anyway (a crash-looping bad deploy is a valid
+	// scenario, not an error). Defaults to 5m.
+	// +optional
+	RolloutTimeout *metav1.Duration `json:"rolloutTimeout,omitempty"`
+}
+
+// DBExecAction runs one-off SQL: a set of statements once on activation
+// (Ensure) and a matching set once on revert. Both run as short-lived Jobs via
+// the operator's own dbtool (`dbtool --once`), so they appear as ordinary
+// database sessions and the operator itself never opens a DB connection.
+//
+// Use this for durable database state a Workload's Job-delete cannot undo: a
+// setting toggled with ALTER TABLE/SYSTEM, a large data change, an index
+// dropped as a "migration". Revert is crash-safe — the statements are carried
+// in the revert token and re-run to convergence, so make them idempotent
+// (SET ... / IF EXISTS / re-runnable).
+type DBExecAction struct {
+	// Name is the identity of the exec Jobs (Ensure Job = <name>, Revert Job =
+	// <name>-revert) and the app label the sessions carry.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=55
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+	// Engine selects the dbtool database driver.
+	// +kubebuilder:validation:Enum=postgres;mysql
+	Engine string `json:"engine"`
+	// Env is passed to the exec container (the DSN via secretKeyRef).
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+	// Ensure runs once, in order, on activation. Each statement must be
+	// idempotent (re-run on retry/restart).
+	// +kubebuilder:validation:MinItems=1
+	Ensure []string `json:"ensure"`
+	// Revert runs once, in order, on revert. Each statement must be idempotent
+	// and tolerate a never-applied Ensure.
+	// +optional
+	Revert []string `json:"revert,omitempty"`
+}
+
+// ChaosMeshAction creates a Chaos Mesh custom resource (e.g. NetworkChaos,
+// StressChaos) verbatim and deletes it on revert. Chaos Mesh's own duration
+// field is set as a dead-man switch so the fault self-recovers if the operator
+// dies.
+type ChaosMeshAction struct {
+	// Kind of Chaos Mesh resource, e.g. NetworkChaos, StressChaos.
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+	// Name of the created chaos object (defaults to fs-<scenario>-<action>).
+	// +optional
+	Name string `json:"name,omitempty"`
+	// Spec is the Chaos Mesh object's .spec, passed through verbatim.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Spec apiextensionsv1.JSON `json:"spec"`
+}
+
+// Action is a single failure-injection step.
+// +kubebuilder:validation:XValidation:rule="(self.type == 'Workload') == has(self.workload) && (self.type == 'Scale') == has(self.scale) && (self.type == 'DeployImage') == has(self.deployImage) && (self.type == 'ChaosMesh') == has(self.chaosMesh) && (self.type == 'DBExec') == has(self.dbExec)",message="exactly one of workload/scale/deployImage/chaosMesh/dbExec must be set and must match type"
+type Action struct {
+	// Name is unique within the scenario.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +kubebuilder:validation:Enum=Workload;Scale;DeployImage;ChaosMesh;DBExec
+	Type string `json:"type"`
+	// Delay offsets this action's activation from the run start.
+	// +optional
+	Delay *metav1.Duration `json:"delay,omitempty"`
+	// +optional
+	Workload *WorkloadAction `json:"workload,omitempty"`
+	// +optional
+	Scale *ScaleAction `json:"scale,omitempty"`
+	// +optional
+	DeployImage *DeployImageAction `json:"deployImage,omitempty"`
+	// +optional
+	ChaosMesh *ChaosMeshAction `json:"chaosMesh,omitempty"`
+	// +optional
+	DBExec *DBExecAction `json:"dbExec,omitempty"`
+}
+
+// MaintenanceJobSpec defines the desired state of a MaintenanceJob.
+type MaintenanceJobSpec struct {
+	DisplayName string `json:"displayName"`
+	// +optional
+	Description string `json:"description,omitempty"`
+	// +kubebuilder:validation:Enum=database;deploy;infra;app;network;kafka;reliability
+	Category string `json:"category"`
+	// Icon is a short technology key the UI uses to show a logo next to the
+	// scenario (e.g. postgres, mongodb, mysql, java, go, nodejs, python, rust).
+	// +optional
+	Icon string `json:"icon,omitempty"`
+	// ExpectedSymptoms documents the telemetry an RCA tool should observe
+	// (used for grading, not by the operator).
+	// +optional
+	ExpectedSymptoms []string `json:"expectedSymptoms,omitempty"`
+	// Enabled holds the failure active while true (sticky). If duration is
+	// set, the run auto-expires and the operator flips enabled back to false.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// Trigger starts a one-shot manual run.
+	// +optional
+	Trigger *TriggerSpec `json:"trigger,omitempty"`
+	// Duration is the default hold time for enabled=true runs (auto-expiry).
+	// Empty means hold until disabled.
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
+	// +kubebuilder:validation:MinItems=1
+	Actions []Action `json:"actions"`
+}
+
+// CurrentRun describes the run in progress.
+type CurrentRun struct {
+	ID string `json:"id"`
+	// +kubebuilder:validation:Enum=Manual;Enabled
+	Trigger   string      `json:"trigger"`
+	StartedAt metav1.Time `json:"startedAt"`
+	// +optional
+	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
+}
+
+// ActiveAction is the durable record of one injected (or in-flight) action.
+// The revert token is fully self-contained: reverting never consults spec.
+type ActiveAction struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	// +kubebuilder:validation:Enum=Recorded;Applied;Reverting
+	Phase string `json:"phase"`
+	// +optional
+	AppliedAt *metav1.Time `json:"appliedAt,omitempty"`
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+	// Revert is the opaque, self-contained revert token persisted BEFORE any
+	// mutation is made.
+	Revert apiextensionsv1.JSON `json:"revert"`
+}
+
+// RunHistoryEntry records a finished run.
+type RunHistoryEntry struct {
+	ID        string      `json:"id"`
+	Trigger   string      `json:"trigger"`
+	StartedAt metav1.Time `json:"startedAt"`
+	// +optional
+	EndedAt *metav1.Time `json:"endedAt,omitempty"`
+	// +kubebuilder:validation:Enum=Completed;Reverted;Failed
+	Result string `json:"result"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// MaintenanceJobStatus defines the observed state of a MaintenanceJob.
+type MaintenanceJobStatus struct {
+	// +kubebuilder:validation:Enum=Idle;Activating;Active;Reverting;Degraded
+	// +kubebuilder:default=Idle
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	CurrentRun *CurrentRun `json:"currentRun,omitempty"`
+	// +optional
+	ActiveActions []ActiveAction `json:"activeActions,omitempty"`
+	// +optional
+	LastCompletedRunID string `json:"lastCompletedRunID,omitempty"`
+	// +kubebuilder:validation:MaxItems=10
+	// +optional
+	History []RunHistoryEntry `json:"history,omitempty"`
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=mj
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Category",type=string,JSONPath=`.spec.category`
+// +kubebuilder:printcolumn:name="Enabled",type=boolean,JSONPath=`.spec.enabled`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// MaintenanceJob is a reproducible failure that the operator can inject and
+// durably revert.
+type MaintenanceJob struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec MaintenanceJobSpec `json:"spec"`
+	// +optional
+	Status MaintenanceJobStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// MaintenanceJobList contains a list of MaintenanceJob.
+type MaintenanceJobList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []MaintenanceJob `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&MaintenanceJob{}, &MaintenanceJobList{})
+}
